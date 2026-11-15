@@ -1,5 +1,9 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { get } from "svelte/store";
+  import { chatHistory, conversationTitle, type PlainMessage } from "../../lib/chatHistory";
+  import { currentRoute } from "../../stores/route";
+  import { selectedPlaygroundTab } from "../../stores/playground";
   import { hasListedModels, playgroundModels } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import { showGenerationStats } from "../../stores/generationStats";
@@ -14,13 +18,14 @@
   import ModelSelector from "./ModelSelector.svelte";
   import ChatComposer from "./ChatComposer.svelte";
   import EmptyState from "../EmptyState.svelte";
-  import { Settings, Paperclip, SquarePen } from "@lucide/svelte";
+  import { Settings, Paperclip, SquarePen, History, Check } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
   import { Label } from "$lib/components/ui/label/index.js";
   import * as Select from "$lib/components/ui/select/index.js";
   import * as Dialog from "$lib/components/ui/dialog/index.js";
+  import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
   import { Tabs, TabsContent, TabsList, TabsTrigger } from "$lib/components/ui/tabs/index.js";
   import { X } from "@lucide/svelte";
 
@@ -40,26 +45,8 @@
     systemPromptStore.set("");
   }
 
-  /** Chat holds no tool turns; the Docs tab is where tool calling lives. */
-  type PlainMessage = ChatMessage & { role: "user" | "assistant" | "system" };
-
-  function loadMessages(): PlainMessage[] {
-    try {
-      const saved = localStorage.getItem("playground-messages");
-      const parsed = saved ? JSON.parse(saved) : [];
-      if (!Array.isArray(parsed)) return [];
-      // A history left over from when this tab was agentic still holds tool
-      // turns this tab cannot render or replay. Sending one upstream is a hard
-      // 400, so they are dropped on load.
-      return parsed.filter(
-        (msg: ChatMessage): msg is PlainMessage => msg?.role !== "tool" && !msg?.tool_calls?.length
-      );
-    } catch {
-      return [];
-    }
-  }
-
-  let messages = $state<PlainMessage[]>(loadMessages());
+  const messagesStore = chatHistory.messages;
+  const activeConversationId = chatHistory.activeId;
   let userInput = $state("");
   let isStreaming = $state(false);
   let isReasoning = $state(false);
@@ -68,11 +55,45 @@
   let messagesContainer: HTMLDivElement | undefined = $state();
   let inputRef: HTMLTextAreaElement | null = $state(null);
   let showSettings = $state(false);
+  let historyLimitDraft = $state<number | undefined>(get(chatHistory).limit);
+  function setSettingsOpen(open: boolean) {
+    if (open) historyLimitDraft = get(chatHistory).limit;
+    else if (historyLimitDraft !== undefined) chatHistory.setLimit(historyLimitDraft);
+    showSettings = open;
+  }
   let attachedImages = $state<string[]>([]);
   let fileInput = $state<HTMLInputElement | null>(null);
   let imageError = $state<string | null>(null);
 
   let userScrolledUp = $state(false);
+  let showClearHistory = $state(false);
+  let requestVersion = 0;
+  let composerVersion = 0;
+  onMount(() => {
+    let previous = get(activeConversationId);
+    const unsubscribe = activeConversationId.subscribe((id) => {
+      if (id === previous) return;
+      previous = id;
+      requestVersion++;
+      composerVersion++;
+      abortController?.abort();
+      abortController = null;
+      isStreaming = false;
+      isReasoning = false;
+      reasoningStartTime = 0;
+      userInput = "";
+      attachedImages = [];
+      imageError = null;
+      userScrolledUp = false;
+    });
+    return () => { requestVersion++; composerVersion++; abortController?.abort(); unsubscribe(); };
+  });
+  let wasOnChat = false;
+  $effect(() => {
+    const onChat = $currentRoute === "/playground" && $selectedPlaygroundTab === "chat";
+    if (onChat && !wasOnChat) chatHistory.enter();
+    wasOnChat = onChat;
+  });
 
   /**
    * Context window of the model the next request goes to. Looked up when the
@@ -142,29 +163,12 @@
 
   // Auto-scroll when messages change — skip if user scrolled up
   $effect(() => {
-    if (messages.length > 0 && messagesContainer && !userScrolledUp) {
+    if ($messagesStore.length > 0 && messagesContainer && !userScrolledUp) {
       messagesContainer.scrollTo({
         top: messagesContainer.scrollHeight,
         behavior: isStreaming ? "instant" : "smooth",
       });
     }
-  });
-
-  // Persist messages to localStorage (throttled to once per 2s)
-  let lastSaveTime = 0;
-  $effect(() => {
-    const json = JSON.stringify(messages);
-    const elapsed = Date.now() - lastSaveTime;
-    const save = () => {
-      try { localStorage.setItem("playground-messages", json); } catch {}
-      lastSaveTime = Date.now();
-    };
-    if (elapsed >= 2000) {
-      save();
-      return;
-    }
-    const timer = setTimeout(save, 2000 - elapsed);
-    return () => clearTimeout(timer);
   });
 
   async function sendMessage() {
@@ -188,14 +192,15 @@
       content = trimmedInput;
     }
 
+    composerVersion++;
     // Add user message
-    messages = [...messages, { role: "user", content }];
+    $messagesStore = [...$messagesStore, { role: "user", content }];
     userInput = "";
     attachedImages = [];
     imageError = null;
 
     // Generate response from the new user message
-    await regenerateFromIndex(messages.length - 1);
+    await regenerateFromIndex($messagesStore.length - 1);
   }
 
   function cancelStreaming() {
@@ -205,19 +210,18 @@
   function newChat() {
     if (isStreaming) {
       cancelStreaming();
+      patchLast({ interrupted: "cancelled" });
     }
-    messages = [];
-    isReasoning = false;
-    reasoningStartTime = 0;
+    chatHistory.newChat();
   }
 
   /** Merges a patch into the last message. */
   function patchLast(patch: Partial<PlainMessage>) {
-    messages = messages.map((msg, i) => (i === messages.length - 1 ? { ...msg, ...patch } : msg));
+    $messagesStore = $messagesStore.map((msg, i) => (i === $messagesStore.length - 1 ? { ...msg, ...patch } : msg));
   }
 
   function lastText(): string {
-    const last = messages[messages.length - 1];
+    const last = $messagesStore[$messagesStore.length - 1];
     return typeof last?.content === "string" ? last.content : "";
   }
 
@@ -228,7 +232,7 @@
         isReasoning = true;
         reasoningStartTime = Date.now();
       }
-      const last = messages[messages.length - 1];
+      const last = $messagesStore[$messagesStore.length - 1];
       patchLast({ reasoning_content: (last?.reasoning_content || "") + text });
       return;
     }
@@ -260,7 +264,7 @@
     if ($systemPromptStore.trim()) {
       out.push({ role: "system", content: $systemPromptStore.trim() });
     }
-    out.push(...messages.slice(0, -1)); // everything but the empty placeholder
+    out.push(...$messagesStore.slice(0, -1)); // everything but the empty placeholder
     return out;
   }
 
@@ -272,23 +276,26 @@
    */
   function statsFor(idx: number) {
     if (!$showGenerationStats) return undefined;
-    const msg = messages[idx];
+    const msg = $messagesStore[idx];
     if (msg.role === "assistant") return msg.stats;
-    const next = messages[idx + 1];
+    const next = $messagesStore[idx + 1];
     return next?.role === "assistant" ? next.stats : undefined;
   }
 
   /** True for the streaming assistant turn and the user message that prompted it. */
   function statsLiveFor(idx: number) {
-    return $showGenerationStats && isStreaming && idx >= messages.length - 2;
+    return $showGenerationStats && isStreaming && idx >= $messagesStore.length - 2;
   }
 
   async function regenerateFromIndex(idx: number) {
+    const version = ++requestVersion;
+    const chatId = get(activeConversationId);
+    const isCurrent = () => version === requestVersion && get(activeConversationId) === chatId;
     // Remove all messages after the edited user message
-    messages = messages.slice(0, idx + 1);
+    $messagesStore = $messagesStore.slice(0, idx + 1);
 
     // Add empty assistant message for the new response
-    messages = [...messages, { role: "assistant", content: "" }];
+    $messagesStore = [...$messagesStore, { role: "assistant", content: "" }];
 
     isStreaming = true;
     isReasoning = false;
@@ -299,7 +306,7 @@
     // the backend is quiet (prompt processing, a slow token), on a timer too.
     const tracker = startTracking(performance.now(), selectedContextLength());
     const ticker = window.setInterval(() => {
-      patchLast({ stats: currentStats(tracker, performance.now(), true) });
+      if (isCurrent()) patchLast({ stats: currentStats(tracker, performance.now(), true) });
     }, 200);
 
     try {
@@ -318,6 +325,7 @@
       );
 
       for await (const chunk of stream) {
+        if (!isCurrent()) break;
         const now = performance.now();
         trackChunk(tracker, chunk, now);
         if (chunk.done) break;
@@ -327,13 +335,16 @@
       }
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") markCancelled(tracker);
-      handleTurnError(error);
+      if (isCurrent()) handleTurnError(error);
     } finally {
       window.clearInterval(ticker);
-      patchLast({ stats: currentStats(tracker, performance.now(), false) });
-      isStreaming = false;
-      isReasoning = false;
-      abortController = null;
+      if (isCurrent()) {
+        patchLast({ stats: currentStats(tracker, performance.now(), false) });
+        isStreaming = false;
+        isReasoning = false;
+        abortController = null;
+        chatHistory.flush();
+      }
     }
   }
 
@@ -341,7 +352,7 @@
     if (isStreaming || !$selectedModelStore) return;
 
     // Update the user message at the specified index
-    messages = messages.map((msg, i) =>
+    $messagesStore = $messagesStore.map((msg, i) =>
       i === idx ? { ...msg, content: newContent } : msg
     );
 
@@ -357,11 +368,14 @@
   }
 
   async function processImageFiles(files: File[]): Promise<void> {
+    const version = composerVersion;
+    const chatId = get(activeConversationId);
+    const isCurrent = () => composerVersion === version && get(activeConversationId) === chatId;
     imageError = null;
-    const error = await appendImageFiles(files, () => attachedImages, (images) => {
-      attachedImages = images;
+    const error = await appendImageFiles(files, () => isCurrent() ? attachedImages : [], (images) => {
+      if (isCurrent()) attachedImages = images;
     });
-    if (error) imageError = error;
+    if (error && isCurrent()) imageError = error;
   }
 
   function handleImageSelect(event: Event) {
@@ -393,10 +407,27 @@
       match={{ inputModalities: ["text", "image"], outputModalities: ["text"] }}
     />
     <div class="flex shrink-0 gap-2">
-      <Button variant="outline" size="icon" onclick={() => (showSettings = true)} title="Chat settings">
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger
+          class="inline-flex size-9 shrink-0 items-center justify-center rounded-md border bg-background hover:bg-accent disabled:opacity-50"
+          disabled={isStreaming || $chatHistory.limit === 0 || !$chatHistory.items.some((item) => item.messages.length)}
+          title="Chat history" aria-label="Chat history"
+        ><History class="size-4" /></DropdownMenu.Trigger>
+        <DropdownMenu.Content align="end" avoidCollisions={true} collisionPadding={8}
+          class="w-72 max-w-[calc(100vw-1rem)] max-h-[min(24rem,var(--bits-floating-available-height))]">
+          <DropdownMenu.Label>Chat history</DropdownMenu.Label>
+          {#each $chatHistory.items.filter((item) => item.messages.length) as item (item.id)}
+            <DropdownMenu.Item onSelect={() => chatHistory.open(item.id)} title={conversationTitle(item.messages)}>
+              <span class="flex-1 truncate">{conversationTitle(item.messages)}</span>
+              {#if item.id === $activeConversationId}<Check class="size-4 shrink-0" />{/if}
+            </DropdownMenu.Item>
+          {/each}
+        </DropdownMenu.Content>
+      </DropdownMenu.Root>
+      <Button variant="outline" size="icon" onclick={() => setSettingsOpen(true)} title="Chat settings">
         <Settings />
       </Button>
-      <Button variant="outline" onclick={newChat} disabled={messages.length === 0 && !isStreaming} title="New chat">
+      <Button variant="outline" onclick={newChat} disabled={$messagesStore.length === 0 && !isStreaming} title="New chat">
         <SquarePen />
         <span class="hidden sm:inline">New Chat</span>
       </Button>
@@ -404,7 +435,7 @@
   </div>
 
   <!-- Settings dialog -->
-  <Dialog.Root bind:open={showSettings}>
+  <Dialog.Root open={showSettings} onOpenChange={setSettingsOpen}>
     <Dialog.Content
       class="top-8 translate-y-0 max-w-xl max-h-[calc(100dvh-2rem)] overflow-y-auto"
       style={settingsStyle}
@@ -420,6 +451,7 @@
         <TabsList variant="line" class="justify-start">
           <TabsTrigger value="prompt">Prompt</TabsTrigger>
           <TabsTrigger value="params">Parameters</TabsTrigger>
+          <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
         <TabsContent value="prompt">
@@ -523,13 +555,35 @@
             <p class="text-muted-foreground mt-1 text-xs">Required for /v1/messages.</p>
           </div>
         </TabsContent>
+        <TabsContent value="history" class="space-y-4">
+          <div class="space-y-2">
+            <Label for="history-limit">Conversations to keep</Label>
+            <Input id="history-limit" type="number" min="0" step="1" bind:value={historyLimitDraft} disabled={isStreaming} />
+            <p class="text-xs text-muted-foreground">Includes the current conversation. Default: 1. Set to 0 to save nothing and start blank whenever you open Chat. Changes apply when settings close.</p>
+          </div>
+          <Button variant="destructive" disabled={isStreaming} onclick={() => showClearHistory = true}>Clear history</Button>
+        </TabsContent>
       </Tabs>
 
       <Dialog.Footer>
-        <Button variant="outline" onclick={() => (showSettings = false)}>Done</Button>
+        <Button variant="outline" onclick={() => setSettingsOpen(false)}>Done</Button>
       </Dialog.Footer>
     </Dialog.Content>
   </Dialog.Root>
+
+  <Dialog.Root bind:open={showClearHistory}>
+    <Dialog.Content class="sm:max-w-sm">
+      <Dialog.Header>
+        <Dialog.Title>Clear chat history?</Dialog.Title>
+        <Dialog.Description>This erases saved conversations and clears the current chat. This cannot be undone.</Dialog.Description>
+      </Dialog.Header>
+      <Dialog.Footer>
+        <Button variant="outline" onclick={() => showClearHistory = false}>Cancel</Button>
+        <Button variant="destructive" onclick={() => { chatHistory.clear(); showClearHistory = false; }}>Clear history</Button>
+      </Dialog.Footer>
+    </Dialog.Content>
+  </Dialog.Root>
+  {#if $chatHistory.error}<p role="alert" class="mb-2 text-xs text-destructive">{$chatHistory.error}</p>{/if}
 
   <!-- Empty state for no models configured -->
   {#if !$hasListedModels}
@@ -543,23 +597,23 @@
       bind:this={messagesContainer}
       onscroll={handleMessagesScroll}
     >
-      {#if messages.length === 0}
+      {#if $messagesStore.length === 0}
         <EmptyState full message="Start a conversation by typing a message below." />
       {:else}
         <div class="mx-auto w-full max-w-3xl py-2">
-        {#each messages as message, idx (idx)}
+        {#each $messagesStore as message, idx (idx)}
           <ChatMessageComponent
             role={message.role}
             content={message.content}
             reasoning_content={message.reasoning_content}
             reasoningTimeMs={message.reasoningTimeMs}
-            isStreaming={isStreaming && idx === messages.length - 1 && message.role === "assistant"}
-            isReasoning={isReasoning && idx === messages.length - 1 && message.role === "assistant"}
+            isStreaming={isStreaming && idx === $messagesStore.length - 1 && message.role === "assistant"}
+            isReasoning={isReasoning && idx === $messagesStore.length - 1 && message.role === "assistant"}
             stats={statsFor(idx)}
             statsLive={statsLiveFor(idx)}
             onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
             interrupted={message.interrupted}
-            onRegenerate={!isStreaming && message.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
+            onRegenerate={!isStreaming && message.role === "assistant" && idx > 0 && $messagesStore[idx - 1].role === "user"
               ? () => regenerateFromIndex(idx - 1)
               : undefined}
           />
